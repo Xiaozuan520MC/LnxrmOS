@@ -69,7 +69,13 @@ static void kbd_process_sc(u8 sc)
             c = c - 'a' + 'A';
         else if (capslock_on && c >= 'A' && c <= 'Z')
             c = c - 'A' + 'a';
-        input_push(c);
+        /* The console ring gets the character only while no GUI holds the
+         * console (con_capture, 46): captured, typing reaches a shell
+         * solely through kbd_inject (35), which is how the desktop's
+         * Terminal window talks to it -- real keys would race the very
+         * window the user is typing into.  The unified queue below is
+         * the desktop's own stream and is never gated. */
+        if (!console_captured()) input_push(c);
         /* 39: the unified queue gets the same decoded character plus the
          * recipe (which modifiers were engaged) -- the character is
          * already transformed, the flags say *why*.  Break codes left at
@@ -108,7 +114,8 @@ extern int lnxrm_uart_trygetc(void);
 void serial_rx_handler(struct intr_frame *f)
 {
     int c;
-    while ((c = lnxrm_uart_trygetc()) >= 0) input_push((char)c);
+    while ((c = lnxrm_uart_trygetc()) >= 0)
+        if (!console_captured()) input_push((char)c);
 }
 
 /* ---- ring buffer for console input ---- */

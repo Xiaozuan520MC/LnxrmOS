@@ -15,6 +15,7 @@
 #include <boot.h>
 #include <mm/mm.h>
 #include <sys/cpu.h>
+#include <sys/sched.h>
 #include <sys/spinlock.h>
 #include <io.h>
 #include <font8x16.h>
@@ -659,6 +660,20 @@ void fb_console_putc(char c)
     fb_present_due();
 }
 
+/* con_capture release (see framebuffer.h): blank the surface and replay
+ * the ring over it, then present once.  The lock order matters -- this
+ * takes console_out_lock for the present, so its caller (print.c's
+ * unmute paths) must not hold it. */
+void fb_console_restore(void)
+{
+    if (!fb_active) return;
+    fbc_row = fbc_col = 0;
+    fb_clear(fbc_bg);
+    int n = ring_get_count();
+    for (int i = 0; i < n; i++) fb_console_putc(ring_get_char(i));
+    fb_flip();
+}
+
 void fb_console_init(void)
 {
     fbc_cols = fb_width / FB_CELL_W;
@@ -1232,6 +1247,36 @@ void fb_fill_rect(u32 x, u32 y, u32 w, u32 h, u32 color)
             fb_store(base + (u64)col * fb_pxsz, px);
     }
     fb_mark_dirty(x, y, w, h); /* clamped; a fully off-screen rect marks nothing */
+}
+
+/* fb_blit (syscall 45): one rectangle of user-packed pixels, h rows of
+ * exactly w.  The rows arrive as 0x00RRGGBB words -- the same colour
+ * vocabulary the drawing calls take -- and land in the drawing surface
+ * through the same fb_rgb_px/fb_store path, so a 16bpp mode stores
+ * converted pixels exactly like fb_fill would.  Clipping mirrors
+ * fb_fill_rect: rows and columns past the edge are dropped, but a source
+ * row is still consumed whole (the caller's buffer is packed, so skipping
+ * source pixels is how a clipped column reads on).  Rows are copied one
+ * at a time through copy_from_user -- a bad pointer spoils at most the
+ * rows that had not been drawn yet, and the region that did land is
+ * marked so the surface and the screen never disagree about what is in
+ * it.  Runs under console_out_lock, like every other surface writer. */
+void fb_blit(u32 x, u32 y, u32 w, u32 h, const u32 *upix)
+{
+    if (!fb_ptr || !upix || !w || !h) return;
+    if (w > FB_MAX_DIM) return; /* the staging row below is sized for one */
+    static u32 stage[FB_MAX_DIM];
+
+    u32 rows_drawn = 0;
+    for (u32 r = 0; r < h && y + r < fb_height; r++) {
+        if (copy_from_user(stage, upix + (size_t)r * w, (size_t)w * sizeof(u32)) != 0)
+            break; /* EFAULT at the caller: keep what landed, no further rows */
+        volatile u8 *base = fb_ptr + (u64)(y + r) * fb_pitch;
+        for (u32 c = x; c < x + w && c < fb_width; c++)
+            fb_store(base + (u64)c * fb_pxsz, fb_rgb_px(stage[c]));
+        rows_drawn = r + 1;
+    }
+    if (rows_drawn) fb_mark_dirty(x, y, w, rows_drawn);
 }
 
 void fb_draw_char(u32 x, u32 y, char ch, u32 fg, u32 bg)

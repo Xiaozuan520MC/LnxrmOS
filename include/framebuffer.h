@@ -87,6 +87,11 @@ void fb_tick_flush(void);
  * is no palette lookup anywhere in the drawing path. */
 void fb_clear(u32 color);
 void fb_fill_rect(u32 x, u32 y, u32 w, u32 h, u32 color);
+/* fb_blit (syscall 45): one rectangle of user-packed 0x00RRGGBB pixels --
+ * h rows of exactly w -- copied into the drawing surface and marked dirty.
+ * The user pointer is read with copy_from_user, one bounded row at a
+ * time, so a bad pointer answers EFAULT instead of faulting the kernel. */
+void fb_blit(u32 x, u32 y, u32 w, u32 h, const u32 *upix);
 void fb_draw_char(u32 x, u32 y, char ch, u32 fg, u32 bg);
 void fb_puts(u32 x, u32 y, const char *s, u32 fg, u32 bg);
 
@@ -143,6 +148,11 @@ void fb_poke_back_px(u32 x, u32 y, u32 raw);
 /* framebuffer text console (mirrors VGA text mode) */
 void fb_console_init(void);
 void fb_console_putc(char c);
+/* con_capture release: the desktop's frame is still on the surface and
+ * the console keeps its picture nowhere but in those pixels, so the way
+ * back is a fresh blank grid refilled from the replay ring.  Takes and
+ * releases console_out_lock itself; call it unlocked. */
+void fb_console_restore(void);
 /* End of a console write batch: called from console_out_unlock() so each
  * printed message becomes one frame before the first timer tick.  No-op
  * once ticks own presenting (see framebuffer.c). */

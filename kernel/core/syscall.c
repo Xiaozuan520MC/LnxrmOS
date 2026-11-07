@@ -6,6 +6,7 @@
 #include <sys/protect.h>
 #include <console.h>
 #include <mm/mm.h>
+#include <mm/vma.h>
 #include <framebuffer.h>
 
 long sys_getdent(int fd, void *ubuf, size_t len);
@@ -15,7 +16,12 @@ int blk_list_all(void *ubuf, int max);
 static long sys_brk(u64 newbrk)
 {
     if (!newbrk) return (long)current->brk_cur;
-    if ((u64)newbrk < (u64)current->brk_base || newbrk > USER_STACK_TOP - (1 << 20))
+    /* Ceiling = MMAP_LO, the bottom of the anonymous mmap window (types.h).
+     * The old cap, one MiB below USER_STACK_TOP, sat INSIDE that window --
+     * a maxed heap and an mmap region could have claimed the same pages.
+     * The stack floor (MMAP_TOP) is above MMAP_LO with the mmap window
+     * between them, so heap, mmap and stack can now never meet. */
+    if ((u64)newbrk < (u64)current->brk_base || newbrk > MMAP_LO)
         return LNXRM_ENOMEM;
     u64 old = ALIGN_UP((u64)current->brk_cur, PAGE_SIZE);
     u64 tgt = ALIGN_UP(newbrk, PAGE_SIZE);
@@ -67,6 +73,183 @@ static long sys_brk(u64 newbrk)
     current->brk_cur = (void *)newbrk;
     if (current->mem_pages > current->mem_peak) current->mem_peak = current->mem_pages;
     return (long)current->brk_cur;
+}
+
+/* ---- anonymous mmap / munmap (T-MMAP) ----
+ *
+ * The int 0x80 ABI passes three arguments (rdi, rsi, r10), so mmap is
+ * mmap(addr, len, prot) with no room for a flags word: `addr` must be 0
+ * (the kernel picks the address) and anything else answers EINVAL rather
+ * than pretending to honour a hint it would then ignore.  prot is the
+ * LNXRM_PROT_* mask; unknown bits are masked off so a later flag stays
+ * forward-compatible instead of breaking old callers.
+ *
+ * Nothing is mapped here.  sys_mmap records one VMA (mm/vma.c) and the
+ * first touch of each page goes through the #PF dispatch
+ * (page_fault.c demand_page), which meters the frame against
+ * cred_mem_quota().  An untouched range therefore costs one kmalloc node
+ * -- which is what lets the window be 64 GiB without pretending to own
+ * 16 million frames it will never get. */
+static long sys_mmap(u64 addr, u64 len, u64 prot)
+{
+    if (addr != 0) return LNXRM_EINVAL; /* kernel-chosen address only */
+    if (!len) return LNXRM_EINVAL;
+    if (len > MMAP_TOP - MMAP_LO) return LNXRM_ENOMEM;
+
+    u64 size = ALIGN_UP(len, PAGE_SIZE);
+    if (size > MMAP_TOP - MMAP_LO) return LNXRM_ENOMEM;
+
+    /* Top-down placement: scan every gap in [MMAP_LO, MMAP_TOP) and take
+     * the HIGHEST one that fits (mmap habit: grow down from the top, so
+     * regions cluster below the stack floor and the low heap stays
+     * contiguous for brk).  Each gap is [prev end, next start); page
+     * alignment of both bounds makes `gap_hi - size` page-aligned too. */
+    u64 best_hi = 0, prev_end = MMAP_LO;
+    for (struct vma *v = current->vmas; v; v = v->next) {
+        u64 lo = prev_end > MMAP_LO ? prev_end : MMAP_LO;
+        if (v->start > lo && v->start - lo >= size && v->start > best_hi)
+            best_hi = v->start;
+        prev_end = v->end;
+    }
+    {
+        u64 lo = prev_end > MMAP_LO ? prev_end : MMAP_LO;
+        if (MMAP_TOP > lo && MMAP_TOP - lo >= size && MMAP_TOP > best_hi)
+            best_hi = MMAP_TOP;
+    }
+    if (!best_hi) return LNXRM_ENOMEM; /* no gap fits: address space full */
+
+    u64 start = best_hi - size;
+    int rc = vma_insert(current, start, start + size, (u32)(prot & 0x7));
+    if (rc < 0) return rc;
+    return (long)start;
+}
+
+/* munmap(addr, len): drop [addr, ALIGN_UP(len)) from the VMA list and unmap
+ * whatever pages happen to be present there.  POSIX-shaped: a range that
+ * only PARTLY overlaps mapping is fine (the overlap is unmapped, the rest
+ * of the VMA survives -- vma_erase cuts and splits), while a range that
+ * intersects nothing answers EINVAL so a bad pointer is loud instead of a
+ * silent no-op.  Shared (COW) frames survive their reference count: each
+ * pmm_free here drops one owner, and the frame dies only with the last. */
+static long sys_munmap(u64 addr, u64 len)
+{
+    if (addr & (PAGE_SIZE - 1)) return LNXRM_EINVAL;
+    if (!len) return LNXRM_EINVAL;
+    if (addr < MMAP_LO || addr >= MMAP_TOP) return LNXRM_EINVAL;
+
+    u64 size = ALIGN_UP(len, PAGE_SIZE);
+    if (size == 0 || addr + size < addr) return LNXRM_EINVAL; /* overflow */
+    u64 end = addr + size > MMAP_TOP ? MMAP_TOP : addr + size;
+
+    /* Range first: if nothing intersects, no page may be unmapped either.
+     * vma_erase also guarantees it changed nothing when the split node
+     * could not be allocated (ENOMEM), so the page loop below only ever
+     * runs against a range the list has already conceded. */
+    int rc = vma_erase(current, addr, end);
+    if (rc < 0) return rc;
+
+    for (u64 va = addr; va < end; va += PAGE_SIZE) {
+        u64 pa = vmm_unmap_user(current->pml4, va);
+        if (!pa) continue;
+        pmm_free(pa);
+        /* the frame may have been the last in its 2 MiB region: hand the
+         * now-empty tables back too, or every mmap into a fresh region
+         * permanently costs two frames (t_mmap's buddy-exact teardown
+         * fails by exactly that on the first run). */
+        vmm_reclaim_empty_tables(current->pml4, va);
+    }
+    /* Re-count rather than decrement: the page tables are the authority
+     * (same rule as exec/fork/brk), so an unmapped count can never drift
+     * from what ps will later report.  munmap is not a hot path. */
+    current->mem_pages = vmm_count_user_pages(current->pml4);
+    return 0;
+}
+
+/* ---- mprotect(addr, len, prot) (T-MPROTECT) ----
+ *
+ * Re-protect [addr, ALIGN_UP(len)) over ANY user range, mmap'd or not --
+ * that reach is the point: flip a JIT region RW->RX, make .text writable
+ * to patch it, seal a stack buffer.  Per page:
+ *   - present            -> the PTE changes now (W and NX, below);
+ *   - not present but claimed by a VMA -> only the VMA changes, and the
+ *     demand pager will map the page with the new prot on first touch;
+ *   - neither            -> ENOMEM (a hole: there is nothing to protect),
+ *     reported before a single bit is touched.
+ *
+ * Granting W never allocates.  A frame another owner also holds is MARKED
+ * PG_COW instead of copied -- the copy happens on the next write through
+ * the existing COW fixer -- so the only allocation in this syscall is the
+ * VMA split nodes, and vma_protect charges for those up front (ENOMEM
+ * therefore always means "nothing changed").  Revoking W clears PG_COW
+ * with it: a COW page left marked would be broken writable by the very
+ * next write fault, silently undoing the revoke.
+ *
+ * Note the read side: x86 has no read-disable without PKU, so PROT_NONE
+ * degrades to "no write, no execute" exactly as it does at mmap time. */
+static long sys_mprotect(u64 addr, u64 len, u64 prot)
+{
+    if (addr & (PAGE_SIZE - 1)) return LNXRM_EINVAL;
+    if (!len) return LNXRM_EINVAL;
+    u64 size = ALIGN_UP(len, PAGE_SIZE);
+    if (!size) return LNXRM_EINVAL; /* len near 2^64: ALIGN_UP wrapped */
+    u64 end = addr + size;
+    if (end < addr || !vmm_is_user_range(addr, end)) return LNXRM_EINVAL;
+    prot &= 0x7; /* forward-compatible: unknown bits mean nothing today */
+
+    /* Coverage first, changes second.  Walk in strides: a page inside a VMA
+     * is covered whatever its state (untouched is fine -- the VMA will speak
+     * for it), so jump to that VMA's end; a page outside one must be
+     * present outright, or the range has a hole in it. */
+    for (u64 pg = addr; pg < end;) {
+        struct vma *v = vma_find(current, pg);
+        if (v) {
+            pg = v->end < end ? v->end : end;
+            continue;
+        }
+        if (!vmm_user_pte(current->pml4, pg)) return LNXRM_ENOMEM;
+        pg += PAGE_SIZE;
+    }
+
+    /* VMAs first: vma_protect is all-or-nothing, and once it returns 0 the
+     * PTE pass below cannot fail (it only rewrites leaves it just read). */
+    int rc = vma_protect(current, addr, end, (u32)prot);
+    if (rc < 0) return rc;
+
+    bool want_w = (prot & LNXRM_PROT_WRITE) != 0;
+    bool want_x = (prot & LNXRM_PROT_EXEC) != 0;
+    for (u64 pg = addr; pg < end; pg += PAGE_SIZE) {
+        u64 pte = vmm_user_pte(current->pml4, pg);
+        if (!pte) continue; /* untouched: the VMA already carries the new prot */
+        u64 pa = pte & PTE_PA_MASK;
+        u64 fresh = pte;
+
+        if (want_x) fresh &= ~PG_NX;
+        else fresh |= PG_NX;
+
+        if (want_w) {
+            if (fresh & PG_W) {
+                /* W with another owner should be impossible -- fork clears
+                 * it on both sides -- but if it ever appears, demote to COW
+                 * rather than leave two spaces writing one frame. */
+                if (!(fresh & PG_COW) && pmm_refcount(pa) > 1)
+                    fresh = (fresh & ~PG_W) | PG_COW;
+            } else if (!(fresh & PG_COW)) {
+                /* Read-only today: give it W outright if this is the only
+                 * owner, else mark PG_COW and let the write fault copy. */
+                if (pmm_refcount(pa) > 1) fresh |= PG_COW;
+                else fresh |= PG_W;
+            }
+            /* !W + PG_COW: already promised a private copy on write; the
+             * VMA now says W too, so nothing here needs to change. */
+        } else {
+            fresh &= ~(PG_W | PG_COW); /* revoke: see the header comment */
+        }
+
+        if (fresh == pte) continue;
+        if (vmm_user_pte_write(current->pml4, pg, fresh) < 0)
+            return LNXRM_EFAIL; /* leaf vanished under us: impossible alone */
+    }
+    return 0;
 }
 
 /* ---- kill(pid, sig) ---- */
@@ -302,6 +485,43 @@ static long sys_fb_flip(void)
     return 0;
 }
 
+/* fb_blit (45): one rectangle of user-packed pixels, h rows of exactly w,
+ * copied into the drawing surface -- the primitive a compositor with its
+ * own backbuffer presents through, where fill draws and blit transfers.
+ * Same two gates and the same lock as the fill it sits beside; the rows
+ * are validated up front (one EFAULT for a bogus extent, before any pixel
+ * moves) and copied one bounded row at a time inside fb_blit itself. */
+static long sys_fb_blit(struct lnxrm_fb_blit *ub)
+{
+    struct lnxrm_fb_blit b;
+    if (!user_ptr_ok((u64)ub, sizeof(b))) return LNXRM_EFAULT;
+    if (copy_from_user(&b, ub, sizeof(b)) != 0) return LNXRM_EFAULT;
+    if (!b.w || !b.h || b.w > FB_MAX_DIM || b.h > FB_MAX_DIM) return LNXRM_EINVAL;
+    if (!user_ptr_ok((u64)b.pixels, (u64)b.w * (u64)b.h * sizeof(u32)))
+        return LNXRM_EFAULT;
+    u64 fl;
+    console_out_lock(&fl);
+    fb_blit(b.x, b.y, b.w, b.h, b.pixels);
+    console_out_unlock(fl);
+    return 0;
+}
+
+/* ---- console capture (46/47) ----
+ * con_capture mutes (or restores) the framebuffer console backend while a
+ * GUI owns the screen; con_read drains the console ring the muted output
+ * keeps flowing into.  Both change or expose what every other process's
+ * output is doing, so both are CAP_SYS_ADMIN (kbd_inject's gate, whose
+ * typing the Terminal window pairs this with). */
+static long sys_con_capture(int on)
+{
+    return console_capture(on ? 1 : 0, current->pid);
+}
+
+static long sys_con_read(char *ubuf, u32 len)
+{
+    return console_read_user(ubuf, len);
+}
+
 /* ---- keyboard syscalls (34-36) ----
  * kbd_get pops one buffered key and kbd_inject types on the console's
  * behalf; both race the shell for the shared input stream, so both are
@@ -443,6 +663,15 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
     case SYS_brk:
         ret = sys_brk(f->rdi);
         break;
+    case SYS_mmap:
+        ret = sys_mmap(f->rdi, f->rsi, a3);
+        break;
+    case SYS_munmap:
+        ret = sys_munmap(f->rdi, f->rsi);
+        break;
+    case SYS_mprotect:
+        ret = sys_mprotect(f->rdi, f->rsi, a3);
+        break;
     case SYS_getdent:
         ret = sys_getdent((int)f->rdi, (void *)f->rsi, a3);
         break;
@@ -506,11 +735,12 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
     case SYS_fb_info:
         ret = sys_fb_info((struct lnxrm_fb_info *)f->rdi);
         break;
-    /* T-033: both gates, in this order, on all five surface calls --
+    /* T-033: both gates, in this order, on all six surface calls --
      * capability (may you draw at all) then ownership (are you the one
      * on the screen).  fb_flip is the fifth: it publishes rather than
-     * draws, but it touches the surface just as directly.  fb_info above
-     * has neither: it draws nothing. */
+     * draws, but it touches the surface just as directly.  fb_blit is the
+     * sixth: it draws, with the caller's pixels instead of a solid colour.
+     * fb_info above has neither: it draws nothing. */
     case SYS_fb_clear:
         if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_clear")) != 0) break;
         if ((ret = fb_owner_gate("fb_clear")) != 0) break;
@@ -535,6 +765,19 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
         if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_flip")) != 0) break;
         if ((ret = fb_owner_gate("fb_flip")) != 0) break;
         ret = sys_fb_flip();
+        break;
+    case SYS_fb_blit:
+        if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_blit")) != 0) break;
+        if ((ret = fb_owner_gate("fb_blit")) != 0) break;
+        ret = sys_fb_blit((struct lnxrm_fb_blit *)f->rdi);
+        break;
+    case SYS_con_capture:
+        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "con_capture")) != 0) break;
+        ret = sys_con_capture((int)f->rdi);
+        break;
+    case SYS_con_read:
+        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "con_read")) != 0) break;
+        ret = sys_con_read((char *)f->rdi, (u32)f->rsi);
         break;
     case SYS_unlink:
         ret = path_syscall(f->rdi, sys_unlink);

@@ -30,11 +30,27 @@ int main(int argc, char **argv)
         xputs("init: no /README.md\n");
     }
 
-    /* Hand the console to a userspace terminal exactly once.  If the
-     * terminal dies (e.g. `kill <pid>`), it stays dead: respawning it
-     * would make the terminal unkillable.  init itself keeps running so
-     * pid 1 still exists to reparent orphans. */
+    /* Boot straight into the desktop: it captures the console (the boot
+     * log stays readable in its Terminal window) and forks the shell the
+     * Terminal types into.  When it leaves the screen -- killed from its
+     * own Task Manager -- the console gets a shell.  Respawning the
+     * desktop here would make an exited desktop unkillable in effect:
+     * one run, then the console is yours. */
     long pid = kfork();
+    if (pid == 0) {
+        char *d_argv[] = {"/bin/desktop", 0};
+        char *envp[] = {0};
+        if (kexecve("/bin/desktop", d_argv, envp) < 0) {
+            xputs("init: exec /bin/desktop failed\n");
+            kexit(1);
+        }
+    }
+    int st = 0;
+    kwaitpid(pid, &st, 0);
+
+    /* The desktop is gone: hand the console to a shell.  If the shell
+     * dies too it stays dead -- respawning it would make it unkillable. */
+    pid = kfork();
     if (pid == 0) {
         char *sh_argv[] = {"/bin/sh", 0};
         char *envp[] = {0};
@@ -43,7 +59,6 @@ int main(int argc, char **argv)
             kexit(1);
         }
     }
-    int st = 0;
     kwaitpid(pid, &st, 0);
     xputs("\ninit: terminal exited\n");
 

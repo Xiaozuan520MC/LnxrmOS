@@ -1,6 +1,7 @@
 #include <console.h>
 #include <mm/mm.h>
 #include <sys/cpu.h>
+#include <sys/sched.h> /* con_read's user-pointer copies */
 #include <io.h>
 #include <sys/spinlock.h>
 #include <disk.h> /* C27: the panic door flushes staged sectors */
@@ -37,10 +38,13 @@ volatile u16 *vga = (volatile u16 *)VGA_VMA;
 int vrow, vcol;
 
 /* ring buffer that captures every character sent to the console,
- * so fb_console_init can replay messages that scrolled off VGA. */
+ * so fb_console_init can replay messages that scrolled off VGA -- and,
+ * since con_capture (syscall 46) arrived, so a GUI shell's Terminal
+ * window can read the whole stream back through con_read (47). */
 #define RING_SIZE 4096
 static char ring_buf[RING_SIZE];
 static int ring_head, ring_count;
+static u64 ring_total; /* chars ever pushed; positions the read cursor */
 
 static void ring_putc(char c)
 {
@@ -52,6 +56,7 @@ static void ring_putc(char c)
         ring_buf[ring_head] = c;
         ring_head = (ring_head + 1) % RING_SIZE;
     }
+    ring_total++;
 }
 
 /* called by fb_console_init to replay buffered output */
@@ -59,6 +64,99 @@ int ring_get_count(void)
 { return ring_count; }
 char ring_get_char(int i)
 { return ring_buf[(ring_head + i) % RING_SIZE]; }
+
+/* ---- console capture (syscalls 46/47) ----
+ * A GUI that owns the screen needs the console to stand down: every
+ * character still reaches serial and this ring, but the framebuffer
+ * backend stops drawing, so nothing the shell or the kernel prints can
+ * land on top of the desktop.  con_read() drains the ring through one
+ * monotonic cursor, starting at the boot log.  The capture is held by a
+ * pid and sys_exit drops it beside the framebuffer ownership it sits
+ * next to, so a killed desktop gives the console its voice back without
+ * anyone remembering to ask. */
+static int con_captured;
+static u32 con_holder;   /* pid that muted the console; 0 = nobody */
+static u64 con_read_pos; /* logical stream position of the read cursor */
+
+int console_capture(int on, u32 pid)
+{
+    u64 fl;
+    console_out_lock(&fl);
+    int was = con_captured;
+    int r = 0;
+    if (on) {
+        if (con_captured && con_holder != pid)
+            r = LNXRM_EACCES; /* another GUI holds the console */
+        else {
+            con_captured = 1;
+            con_holder = pid;
+        }
+    } else {
+        if (con_captured && con_holder != pid)
+            r = LNXRM_EACCES;
+        else {
+            con_captured = 0;
+            con_holder = 0;
+        }
+    }
+    console_out_unlock(fl);
+    /* Unmuting gives the console its screen back -- the desktop's frame
+     * is still on the surface and the console's picture lives nowhere
+     * else, so the pixels get rebuilt from the replay ring.  Outside the
+     * lock: the restore's present takes it itself. */
+    if (!on && was && r == 0) fb_console_restore();
+    return r;
+}
+
+void console_capture_release(u32 pid)
+{
+    u64 fl;
+    console_out_lock(&fl);
+    int was = con_captured && con_holder == pid;
+    if (was) {
+        con_captured = 0;
+        con_holder = 0;
+    }
+    console_out_unlock(fl);
+    if (was) fb_console_restore();
+}
+
+/* The keyboard producers ask this before pushing a real keystroke into
+ * the console ring: captured, the console's input belongs to kbd_inject
+ * (the GUI Terminal's typing) alone, and real keys feed the unified
+ * input queue the desktop reads without ever reaching a shell. */
+int console_captured(void)
+{
+    return con_captured;
+}
+
+long console_read_user(char *ubuf, u32 len)
+{
+    if (!len) return 0;
+    if (len > RING_SIZE) len = RING_SIZE;
+    if (!user_ptr_ok((u64)ubuf, len)) return LNXRM_EFAULT;
+
+    static char stage[RING_SIZE];
+    u64 fl;
+    console_out_lock(&fl);
+    /* a reader that lagged past the overwrite point resumes at the
+     * oldest survivor -- the lost bytes are gone either way */
+    if (ring_total - con_read_pos > (u64)ring_count)
+        con_read_pos = ring_total - (u64)ring_count;
+    u64 avail = ring_total - con_read_pos;
+    if (avail > (u64)len) avail = (u64)len;
+    u64 oldest = ring_total - (u64)ring_count;
+    for (u64 i = 0; i < avail; i++)
+        stage[i] = ring_buf[(u32)(ring_head + (con_read_pos - oldest) + i) % RING_SIZE];
+    con_read_pos += avail;
+    long r = 0;
+    if (avail && copy_to_user(ubuf, stage, (size_t)avail) != 0)
+        r = LNXRM_EFAULT;
+    else
+        r = (long)avail;
+    console_out_unlock(fl);
+    return r;
+}
 
 static void vga_update_cursor(void);
 
@@ -209,8 +307,20 @@ static void esc_process(const char *buf, int len)
 
 void console_putc(char c)
 {
-    /* Always forward to fb console so ANSI escapes reach it */
-    fb_console_putc(c);
+    /* Serial and the replay ring get every character FIRST: the VGA
+     * state machine below swallows escape bytes whole, and a consumer of
+     * the ring (the desktop's Terminal window) needs the sequences
+     * intact -- with the ring write after the machine, `clear` and its
+     * kin were invisible to it.  Serial wants them too; a real terminal
+     * interprets what this one ate. */
+    lnxrm_uart_putc(c);
+    ring_putc(c);
+
+    /* Always forward to fb console so ANSI escapes reach it -- unless the
+     * console is captured (con_capture, syscall 46): a desktop shell that
+     * owns the screen mutes this backend, and the characters it would
+     * have drawn keep flowing to serial and the replay ring above. */
+    if (!con_captured) fb_console_putc(c);
 
     /* Feed ANSI escape sequences into the VGA state machine */
     int r = ansi_feed(&vga_ansi, c);
@@ -259,8 +369,6 @@ void console_putc(char c)
         vga[vrow * VGA_COLS + vcol] = (cur_attr << 8) | (u8)c;
         vcol++;
     }
-    lnxrm_uart_putc(c);
-    ring_putc(c);
     vga_update_cursor();
 }
 

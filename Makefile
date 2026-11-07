@@ -54,6 +54,9 @@ KTEST_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KTEST_SRC_C))
 
 USER_PROGS := $(notdir $(basename $(wildcard userland/bin/*.c)))
 USER_ELFS  := $(addprefix $(BUILD)/user/,$(USER_PROGS))
+# One binary beyond the bins: the desktop shell, built by userland/Makefile
+# from desktop/*.c and shipped next to them.
+DESKTOP_ELF := $(BUILD)/user/desktop
 
 # ---- kernel rules -------------------------------------------------------
 $(BUILD)/%.o: %.c | $(BUILD)
@@ -107,10 +110,11 @@ $(USER_ELFS): $(BUILD)/user/%: userland/bin/%.c userland/lib/ulib.c userland/lib
 $(BUILD):
 	@mkdir -p $@
 
-$(BUILD)/ifsrc/.stamp: $(USER_ELFS) $(BUILD)/README.md | $(BUILD)
+$(BUILD)/ifsrc/.stamp: $(USER_ELFS) $(DESKTOP_ELF) $(BUILD)/README.md | $(BUILD)
 	@rm -rf $(BUILD)/ifsrc
 	@mkdir -p $(BUILD)/ifsrc/bin
 	@cp $(USER_ELFS) $(BUILD)/ifsrc/bin/
+	@cp $(DESKTOP_ELF) $(BUILD)/ifsrc/bin/
 	@cp $(BUILD)/README.md $(BUILD)/ifsrc/
 	@touch $@
 
@@ -208,7 +212,7 @@ $(ISO): $(ISO_KRN) $(ISO_CFG)
 	@grub-mkrescue -o $@ $(ISO_TREE) >$(BUILD)/iso.log 2>&1 || { \
 	  cat $(BUILD)/iso.log >&2; exit 1; }
 
-$(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
+$(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS) $(DESKTOP_ELF)
 	@printf "  DISK    $(SHORT)\n"
 	@dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
 	@# -R 1024: reserve 1024 sectors (512 KiB).  FAT32 leaves the reserved
@@ -219,7 +223,7 @@ $(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
 	@mkfs.vfat -F 32 -R 1024 $@ >/dev/null 2>/dev/null
 	@mcopy -i $@ $(BUILD)/README.md ::README.md
 	@mmd -i $@ ::bin
-	@for f in $(USER_ELFS); do \
+	@for f in $(USER_ELFS) $(DESKTOP_ELF); do \
 	  mcopy -i $@ $$f ::bin/$$(basename $$f); \
 	done
 

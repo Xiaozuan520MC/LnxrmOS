@@ -43,7 +43,14 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  41
+#define LNXRM_SYSCALL_LAST  47
+
+/* mmap() protection bits (same values as Linux PROT_*, shared here so the
+ * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */
+#define LNXRM_PROT_NONE  0
+#define LNXRM_PROT_READ  1
+#define LNXRM_PROT_WRITE 2
+#define LNXRM_PROT_EXEC  4
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST
@@ -171,10 +178,21 @@ struct lnxrm_fb_str {
     const char *str;
 };
 
+/* fb_blit (45): one rectangle of user-packed pixels -- h rows of exactly
+ * w, every pixel a true-colour 0x00RRGGBB value like the drawing calls'
+ * colour arguments.  The kernel copies it into the drawing surface and
+ * marks the region dirty, so the next fb_flip presents it like any other
+ * drawing. */
+struct lnxrm_fb_blit {
+    uint32_t x, y, w, h;
+    const uint32_t *pixels;
+};
+
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_fb_info) == 16, "fb_info ABI");
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_fb_rect) == 20, "fb_rect ABI");
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_fb_char) == 20, "fb_char ABI");
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_fb_str) == 24, "fb_str ABI");
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_fb_blit) == 24, "fb_blit ABI");
 
 /* kbd_info (36): the keyboard/input-stream counters a keyboard probe
  * wants.  capacity is the ring's usable size (255: full at in_w+1==in_r),

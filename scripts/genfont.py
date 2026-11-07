@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Generate desktop/font_aa.h -- the antialiased glyph tables the desktop's
+font.c renders from.
+
+One 16-row cell with the baseline on row 12, ink starting on row 2 for a
+capital -- the geometry the kernel's VGA font had, kept so a glyph is
+positioned by the top of its box.  Three tables:
+
+  fa_ui    proportional regular  -- every GUI label
+  fa_uib   proportional bold     -- titles, headings, the clock
+  fa_mono  fixed 8-pixel advance -- Notepad, path fields, Paint's text tool
+
+Coverage is one byte per pixel (0 = transparent, 255 = solid ink), rendered
+from DejaVuSans / DejaVuSans-Bold / DejaVuSansMono at sizes chosen so the
+cap height lands ~9 px and the mono advance lands on exactly 8.
+
+Usage: python3 scripts/genfont.py   (writes desktop/font_aa.h)
+"""
+
+import os
+import sys
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.exit("genfont.py needs Pillow: python3 -m pip install pillow")
+
+FONT_DIRS = [
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/dejavu",
+]
+
+FIRST, LAST = 0x20, 0x7E
+N = LAST - FIRST + 1
+CELL_H = 16
+BASELINE = 12
+MONO_W = 8
+
+
+def find_font(name):
+    for d in FONT_DIRS:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    sys.exit("font not found: %s (looked in %s)" % (name, FONT_DIRS))
+
+
+def load(path, px):
+    return ImageFont.truetype(path, px)
+
+
+def metrics(f):
+    asc, desc = f.getmetrics()
+    return asc, desc
+
+
+def glyph(f, ch, asc):
+    """(x, y, w, h, adv, coverage bytes) with the baseline on BASELINE."""
+    adv = int(round(f.getlength(ch)))
+    if adv < 1:
+        adv = 1
+    try:
+        x0, y0, x1, y1 = f.getbbox(ch)
+    except ValueError:
+        return 0, 0, 0, 0, adv, b""
+    if x1 <= x0 or y1 <= y0:
+        return 0, 0, 0, 0, adv, b""
+    # Render the glyph with its pen at (M, M + BASELINE - asc): PIL's "la"
+    # anchor puts the baseline `asc` pixels under the pen, so this lands
+    # the baseline on row BASELINE of the cell.  The M margin absorbs any
+    # negative left bearing.
+    M = 8
+    cw = adv + 2 * M
+    chh = CELL_H + 2 * M
+    img = Image.new("L", (cw, chh), 0)
+    ImageDraw.Draw(img).text((M, M + BASELINE - asc), ch, font=f, fill=255)
+    box = (M + x0, M + BASELINE - asc + y0, M + x1, M + BASELINE - asc + y1)
+    cov = img.crop(box).tobytes()
+    y = BASELINE - asc + y0
+    w, h = x1 - x0, y1 - y0
+    # clamp into the cell: drop rows that fall above or below it
+    if y < 0:
+        cov = cov[(-y) * w:]
+        h += y
+        y = 0
+    if y + h > CELL_H:
+        h = CELL_H - y
+        cov = cov[:h * w]
+    if w <= 0 or h <= 0:
+        return 0, 0, 0, 0, adv, b""
+    return x0, y, w, h, adv, cov
+
+
+def build(f):
+    asc, desc = metrics(f)
+    out = []
+    glyphs = []
+    blobs = []
+    total = 0
+    for code in range(FIRST, LAST + 1):
+        ch = chr(code)
+        g = glyph(f, ch, asc)
+        glyphs.append(g)
+        blobs.append(g[5])
+        total += len(g[5])
+    return glyphs, blobs, total
+
+
+def emit(name, glyphs, blobs, out):
+    out.append("/* %s: %d glyphs, proportional advances */" % (name, N))
+    for i, b in enumerate(blobs):
+        if not b:
+            continue
+        out.append("static const unsigned char %s_cov_%d[] = {" % (name, i))
+        for r in range(0, len(b), 16):
+            row = ", ".join(str(v) for v in b[r:r + 16])
+            out.append("    %s," % row)
+        out.append("};")
+    out.append("static const struct fa_glyph %s[] = {" % name)
+    for i, (x, y, w, h, adv, b) in enumerate(glyphs):
+        cov = "%s_cov_%d" % (name, i) if b else "0"
+        out.append("    {%d, %d, %d, %d, %d, %s}," % (x, y, w, h, adv, cov))
+    out.append("};")
+    out.append("")
+
+
+def pick_size(path, want_cap, mono_adv=None):
+    """Smallest px size whose cap height reaches want_cap (and, for mono,
+    whose advance rounds to mono_adv)."""
+    for px in range(8, 20):
+        f = load(path, px)
+        if mono_adv is not None:
+            if int(round(f.getlength("M"))) != mono_adv:
+                continue
+        bb = f.getbbox("H")
+        cap = bb[3] - bb[1]
+        if cap >= want_cap:
+            return px
+    return 12
+
+
+def main():
+    reg = find_font("DejaVuSans.ttf")
+    bold = find_font("DejaVuSans-Bold.ttf")
+    mono = find_font("DejaVuSansMono.ttf")
+
+    px_reg = pick_size(reg, 9)
+    px_bold = pick_size(bold, 9)
+    px_mono = pick_size(mono, 9, mono_adv=MONO_W)
+    print("ui=%dpx bold=%dpx mono=%dpx" % (px_reg, px_bold, px_mono),
+          file=sys.stderr)
+
+    fr = load(reg, px_reg)
+    fb = load(bold, px_bold)
+    fm = load(mono, px_mono)
+
+    ui, ui_b, tui = build(fr)
+    uib, uib_b, tuib = build(fb)
+    mo, mo_b, tmo = build(fm)
+    print("coverage bytes: ui=%d uib=%d mono=%d" % (tui, tuib, tmo),
+          file=sys.stderr)
+
+    out = []
+    out.append("/* Antialiased glyph tables -- GENERATED by scripts/genfont.py,")
+    out.append(" * do not edit by hand.  DejaVuSans %dpx (ui), DejaVuSans-Bold" % px_reg)
+    out.append(" * %dpx (uib), DejaVuSansMono %dpx (mono)." % (px_bold, px_mono))
+    out.append(" *")
+    out.append(" * One %d-row cell, baseline on row %d, ink from row 2 for a" % (CELL_H, BASELINE))
+    out.append(" * capital -- where the kernel's VGA font had it, so a glyph is")
+    out.append(" * still positioned by the top of its box.  Coverage is one byte")
+    out.append(" * per pixel: 0 = transparent, 255 = solid ink. */")
+    out.append("#pragma once")
+    out.append("")
+    out.append("#define FA_CELL_H %d" % CELL_H)
+    out.append("#define FA_MONO_W %d" % MONO_W)
+    out.append("")
+    out.append("struct fa_glyph {")
+    out.append("    int x, y;                /* ink offset inside the cell  */")
+    out.append("    int w, h;                /* ink size, 0 = blank         */")
+    out.append("    int adv;                 /* pen advance in pixels       */")
+    out.append("    const unsigned char *cov; /* w*h bytes, row-major       */")
+    out.append("};")
+    out.append("")
+    emit("fa_ui", ui, ui_b, out)
+    emit("fa_uib", uib, uib_b, out)
+    emit("fa_mono", mo, mo_b, out)
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dest = os.path.join(here, "desktop", "font_aa.h")
+    with open(dest, "w") as f:
+        f.write("\n".join(out))
+    print("wrote %s" % dest, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -81,6 +81,19 @@ size_t vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap);
 int ring_get_count(void);
 char ring_get_char(int i);
 
+/* ---- console capture (syscalls 46/47, implemented in print.c) ----
+ * console_capture(on, pid): the calling pid mutes (or restores) the
+ * framebuffer console backend; output still reaches serial and the
+ * replay ring.  Refused with LNXRM_EACCES while a different pid holds
+ * the capture.  console_read_user(ubuf, len) drains the ring through a
+ * single monotonic cursor, boot log first.  The kernel drops a capture
+ * whose holder exits (console_capture_release from sys_exit), the same
+ * release point fb ownership uses. */
+int console_capture(int on, u32 pid);
+void console_capture_release(u32 pid);
+long console_read_user(char *ubuf, u32 len);
+int console_captured(void);
+
 /* ---- ANSI (CSI) escape tokenizer (lib/.. ansi.c) ----
  * Both console backends (VGA text in print.c, framebuffer in framebuffer.c)
  * consume character streams that may contain sequences like "ESC [ 3 2 m".
